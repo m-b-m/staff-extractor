@@ -1,2 +1,4 @@
 streamlit
-pymupdf
+pymupdf>=1.23
+opencv-python-headless
+pytesseract
