@@ -108,7 +108,9 @@ if uploaded_file is not None:
                     y_cursor += img_height_points + vertical_gap
                 
                 # Save output PDF to memory and provide download
-                output_pdf_bytes = output_doc.save(inplace=False, garbage=4)  # compress and save
+                output_buffer = io.BytesIO()
+                output_doc.save(output_buffer, garbage=4)
+                output_pdf_bytes = output_buffer.getvalue()
                 st.success(f"Extraction complete! Extracted {len(target_labels)} staff systems.")
                 st.download_button(
                     label="Download Extracted PDF",
