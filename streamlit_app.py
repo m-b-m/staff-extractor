@@ -1,113 +1,118 @@
-import streamlit as st
+import re
+import io
 import fitz  # PyMuPDF
-from io import BytesIO
+import streamlit as st
 
-# Utility: convert millimeters to points
-def mm_to_pt(mm):
-    return mm * 72 / 25.4
+st.title("Staff System Extractor")
 
-st.set_page_config(page_title="PDF Staff Extractor", layout="wide")
-st.title("PDF Staff Extraction Tool")
-
-# Sidebar inputs
-st.sidebar.header("Settings")
-uploaded_file = st.sidebar.file_uploader("Upload PDF file", type=["pdf"])
-labels_input = st.sidebar.text_area(
-    "Staff labels to search (one per line)",
-    value="Tenor II\nTen II\nTen. II",
-    height=100
-)
-margin_mm = st.sidebar.number_input("Page margin (mm)", min_value=0.0, value=5.0, step=1.0)
-shift_mm = st.sidebar.number_input("Shift up (mm)", min_value=0.0, value=5.0, step=1.0)
-shrink_mm = st.sidebar.number_input("Shrink total height (mm)", min_value=0.0, value=5.0, step=1.0)
-fallback_height_mm = st.sidebar.number_input("Fallback height if no next label (mm)", min_value=10.0, value=100.0, step=10.0)
-
-if uploaded_file:
-    labels = [line.strip() for line in labels_input.splitlines() if line.strip()]
-    if not labels:
-        st.error("Please enter at least one staff label to search for.")
+# File uploader for PDF
+uploaded_file = st.file_uploader("Upload a music PDF", type=["pdf"])
+if uploaded_file is not None:
+    try:
+        # Load PDF into PyMuPDF document
+        pdf_data = uploaded_file.read()
+        doc = fitz.open(stream=pdf_data, filetype="pdf")
+    except Exception as e:
+        st.error(f"Error opening PDF: {e}")
     else:
-        # Convert settings to points
-        margin_pt = mm_to_pt(margin_mm)
-        shift_up = mm_to_pt(shift_mm)
-        shrink = mm_to_pt(shrink_mm)
-        fallback_height_pt = mm_to_pt(fallback_height_mm)
-        a4 = fitz.paper_rect("a4")
-        W, H = a4.width, a4.height
-
-        # Load PDF
-        src_bytes = uploaded_file.read()
-        src_doc = fitz.open(stream=src_bytes, filetype="pdf")
-        dst_doc = fitz.open()
-
-        # Start first output page
-        out_page = dst_doc.new_page(width=W, height=H)
-        y_offset = margin_pt
-
-        # Process each page
-        for pno in range(len(src_doc)):
-            page = src_doc[pno]
-            # Collect all start hits for given staff labels
-            start_hits = []
-            for lbl in labels:
-                for r in page.search_for(lbl):
-                    start_hits.append((r, lbl))
-            if not start_hits:
-                continue
-            # Sort by vertical position
-            start_hits.sort(key=lambda x: x[0].y0)
-
-            for found, label_used in start_hits:
-                # Compute top boundary
-                y0_orig = max(0, found.y0 - margin_pt - shift_up)
-                # Find next 'Bass I' as end boundary
-                bass_hits = [r for r in page.search_for("Bass I") if r.y0 > found.y0 + 1e-3]
-                if bass_hits:
-                    y1_orig = bass_hits[0].y0 - shift_up
-                else:
-                    y1_orig = found.y1 + fallback_height_pt - shift_up
-                # Validate bounds
-                if y1_orig <= y0_orig:
-                    st.warning(f"Page {pno+1}, '{label_used}': invalid bounds, skipping.")
-                    continue
-                # Center & shrink vertically
-                center = (y0_orig + y1_orig) / 2
-                half_new = max(0, (y1_orig - y0_orig - shrink) / 2)
-                y0 = center - half_new
-                y1 = center + half_new
-                clip = fitz.Rect(0, y0, page.rect.width, y1)
-                if clip.is_empty:
-                    st.warning(f"Page {pno+1}, '{label_used}': empty clip, skipping.")
-                    continue
-                # Scale to fit width
-                scale = (W - 2 * margin_pt) / page.rect.width
-                scaled_h = (y1 - y0) * scale
-                if scaled_h <= 0:
-                    st.warning(f"Page {pno+1}, '{label_used}': zero scaled height, skipping.")
-                    continue
-                # New page if needed
-                if y_offset + scaled_h > H - margin_pt:
-                    out_page = dst_doc.new_page(width=W, height=H)
-                    y_offset = margin_pt
-                # Destination rectangle
-                dest = fitz.Rect(margin_pt, y_offset,
-                                 margin_pt + (W - 2 * margin_pt),
-                                 y_offset + scaled_h)
-                if dest.is_empty:
-                    st.warning(f"Page {pno+1}, '{label_used}': empty destination rect, skipping.")
-                    continue
-                # Render the clip
-                out_page.show_pdf_page(dest, src_doc, pno, clip=clip)
-                y_offset += scaled_h + margin_pt
-
-        # Generate output
-        pdf_bytes = dst_doc.write()
-        st.success("Extraction complete! 🎉")
-        st.download_button(
-            label="Download Extracted PDF",
-            data=pdf_bytes,
-            file_name="extracted_staves.pdf",
-            mime="application/pdf",
-        )
-else:
-    st.info("Upload a PDF and configure labels & settings in the sidebar to get started.")
+        # User input for labels (comma-separated)
+        labels_input = st.text_input("Enter staff labels to extract (comma-separated)", "")
+        if labels_input:
+            # Prepare label list and normalized set for matching
+            label_list = [lbl.strip() for lbl in labels_input.split(",") if lbl.strip()]
+            norm_labels = { re.sub(r"[^A-Za-z0-9]", "", lbl).lower() for lbl in label_list }
+            
+            # Find all candidate labels near left margin
+            left_margin_threshold = 50  # points (approx 0.7 inches) for left-aligned labels
+            all_labels = []  # will hold tuples (page_number, top_y, bottom_y, text)
+            for page_index in range(doc.page_count):
+                page = doc[page_index]
+                blocks = page.get_text("dict")["blocks"]
+                for block in blocks:
+                    if block.get("type") == 0:  # text block
+                        for line in block.get("lines", []):
+                            x0, y0, x1, y1 = line["bbox"]
+                            text = "".join(span["text"] for span in line["spans"]).strip()
+                            if not text:
+                                continue
+                            # Check if text is near left and contains letters (likely a label)
+                            if x0 < left_margin_threshold and re.search("[A-Za-z]", text):
+                                # Exclude obvious non-label lines (composer, title, etc.)
+                                if any(kw in text for kw in ["Words and Music by", "Arr.", "From "]):
+                                    continue
+                                all_labels.append((page_index + 1, y0, y1, text))
+            # Sort labels by page and vertical position
+            all_labels.sort(key=lambda t: (t[0], t[1]))
+            
+            # Filter for target labels
+            target_labels = [lab for lab in all_labels 
+                             if re.sub(r"[^A-Za-z0-9]", "", lab[3]).lower() in norm_labels]
+            
+            if not target_labels:
+                st.warning("No staff systems found for the given labels.")
+            else:
+                # Prepare a new PDF for output
+                output_doc = fitz.open()
+                page_width, page_height = doc[0].rect.width, doc[0].rect.height
+                # Define layout parameters for output pages
+                top_margin = 10  # points
+                bottom_margin = 10
+                vertical_gap = 5   # gap between cropped images on output page
+                # Use a matrix to scale images (for better resolution)
+                zoom_factor = 2.0  # 2x zoom for higher DPI output
+                mat = fitz.Matrix(zoom_factor, zoom_factor)
+                
+                y_cursor = 0
+                output_page = None
+                
+                # Helper function to add a new blank page to output_doc
+                def add_output_page():
+                    return output_doc.new_page(width=page_width, height=page_height)
+                
+                # Iterate through each target label and crop the corresponding region
+                prev_page = None
+                for (page_num, label_y_top, label_y_bottom, label_text) in target_labels:
+                    page = doc[page_num - 1]
+                    # Determine crop top boundary
+                    if prev_page != page_num:  # new page in original PDF
+                        # If this label is first on its page (no previous label on same page)
+                        # include a small margin above
+                        top_crop = max(0, label_y_top - 20)
+                    else:
+                        # Not the first label on page – start exactly at this label
+                        top_crop = label_y_top
+                    prev_page = page_num
+                    # Determine crop bottom boundary (either next label or fallback height)
+                    # Find the next label on the same page
+                    next_label = next((lab for lab in all_labels 
+                                       if lab[0] == page_num and lab[1] > label_y_top), None)
+                    if next_label:
+                        bottom_crop = next_label[1]  # top Y of the next label
+                    else:
+                        # No next label on this page: extend a fixed fallback height
+                        bottom_crop = min(page.rect.height, label_y_top + 120)
+                    
+                    # Clip and render the region to an image (pixmap)
+                    clip_rect = fitz.Rect(0, top_crop, page_width, bottom_crop)
+                    pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+                    img_height_points = pix.height / zoom_factor  # height in points at original scale
+                    
+                    # Start a new output page if needed
+                    if output_page is None or y_cursor + img_height_points > page_height - bottom_margin:
+                        output_page = add_output_page()
+                        y_cursor = top_margin
+                    # Compute target rectangle on output page and insert the image
+                    target_rect = fitz.Rect(0, y_cursor, page_width, y_cursor + img_height_points)
+                    output_page.insert_image(target_rect, pixmap=pix)
+                    # Update cursor for next image position
+                    y_cursor += img_height_points + vertical_gap
+                
+                # Save output PDF to memory and provide download
+                output_pdf_bytes = output_doc.save(inplace=False, garbage=4)  # compress and save
+                st.success(f"Extraction complete! Extracted {len(target_labels)} staff systems.")
+                st.download_button(
+                    label="Download Extracted PDF",
+                    data=output_pdf_bytes,
+                    file_name="extracted_staves.pdf",
+                    mime="application/pdf"
+                )
