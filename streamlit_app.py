@@ -1,133 +1,92 @@
 import streamlit as st
 import fitz  # PyMuPDF
-import io
+from io import BytesIO
 
-# Convert millimeters to points
+# Utility: convert millimeters to points
 def mm_to_pt(mm):
     return mm * 72 / 25.4
 
-# Generate label variants (exact, dotted, abbreviated)
-def gen_variants(label):
-    variants = {label}
-    parts = label.split(' ', 1)
-    if len(parts) == 2:
-        first, rest = parts
-        # dotted first word
-        variants.add(f"{first}. {rest}")
-        # abbreviated first part if endswith 'or'
-        if first.endswith('or'):
-            abbr = first[:-2]
-            variants.add(f"{abbr} {rest}")
-            variants.add(f"{abbr}. {rest}")
-    return variants
+st.set_page_config(page_title="PDF Staff Extractor", layout="wide")
+st.title("PDF Staff Staff Extraction Tool")
 
-# Core extraction function
-# voice_labels: list of exact labels to search (e.g. ['Tenor II', 'Ten II'])
-def extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt):
-    src = fitz.open(stream=input_bytes, filetype='pdf')
-    dst = fitz.open()
-    a4 = fitz.paper_rect('a4')
-    w, h = a4.width, a4.height
-    shift = mm_to_pt(shift_mm)
-    shrink = mm_to_pt(shrink_mm)
+# Sidebar inputs
+st.sidebar.header("Settings")
+uploaded_file = st.sidebar.file_uploader("Upload PDF file", type=["pdf"])
+labels_input = st.sidebar.text_area(
+    "Staff labels to search (one per line)",
+    value="Tenor II\nTen II\nTen. II",
+    height=100
+)
+margin_mm = st.sidebar.number_input("Page margin (mm)", min_value=0.0, value=5.0, step=1.0)
+shift_mm = st.sidebar.number_input("Shift up (mm)", min_value=0.0, value=5.0, step=1.0)
+shrink_mm = st.sidebar.number_input("Shrink total height (mm)", min_value=0.0, value=5.0, step=1.0)
 
-    # Hierarchy for boundary detection
-    hierarchy = ['Tenor I', 'Tenor II', 'Bass I', 'Bass II']
-    # Determine canonical hierarchy label
-    canonical = next((hl for hl in hierarchy if any(lbl in voice_labels for lbl in gen_variants(hl))), None)
-    # Generate boundary variants for next label in hierarchy
-    boundary_variants = set()
-    if canonical:
-        try:
-            idx = hierarchy.index(canonical)
-            next_lbl = hierarchy[idx + 1]
-            for v in gen_variants(next_lbl):
-                boundary_variants.add(v)
-        except (ValueError, IndexError):
-            pass
+if uploaded_file:
+    labels = [line.strip() for line in labels_input.splitlines() if line.strip()]
+    if not labels:
+        st.error("Please enter at least one staff label to search for.")
+    else:
+        # Prepare parameters
+        margin_pt = mm_to_pt(margin_mm)
+        shift_up = mm_to_pt(shift_mm)
+        shrink = mm_to_pt(shrink_mm)
+        a4 = fitz.paper_rect("a4")
+        W, H = a4.width, a4.height
 
-    # Start first output page
-    current_page = dst.new_page(width=w, height=h)
-    y_offset = margin_pt
+        # Open source PDF from bytes
+        src_doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+        dst_doc = fitz.open()
 
-    # Iterate through pages
-    for page_num in range(len(src)):
-        page = src[page_num]
-        # Search for any voice label variant
-        instances = None
-        for user_lbl in voice_labels:
-            for variant in gen_variants(user_lbl):
-                inst = page.search_for(variant)
-                if inst:
-                    instances = inst
+        # Start first output page
+        out_page = dst_doc.new_page(width=W, height=H)
+        y_offset = margin_pt
+
+        for pno in range(len(src_doc)):
+            page = src_doc[pno]
+            found = None
+            for lbl in labels:
+                hits = page.search_for(lbl)
+                if hits:
+                    found = hits[0]
                     break
-            if instances:
-                break
-        if not instances:
-            continue
-        # Top of snippet
-        t = instances[0]
+            if not found:
+                continue
+            # Compute vertical bounds
+            y0_orig = max(0, found.y0 - margin_pt - shift_up)
+            bass_hits = page.search_for("Bass I")
+            if bass_hits:
+                y1_orig = bass_hits[0].y0 - shift_up
+            else:
+                y1_orig = found.y1 + mm_to_pt(100) - shift_up
 
-        # Determine bottom boundary via boundary_variants
-        b_list = []
-        for b_lbl in boundary_variants:
-            b_inst = page.search_for(b_lbl)
-            if b_inst:
-                b_list = b_inst
-                break
-        y0 = max(0, t.y0 - margin_pt - shift)
-        if b_list:
-            y1 = b_list[0].y0 - shift
-        else:
-            # fallback if no boundary label
-            y1 = t.y1 + mm_to_pt(100) - shift
+            # Center and shrink
+            center = (y0_orig + y1_orig) / 2
+            half_new = max(0, (y1_orig - y0_orig - shrink) / 2)
+            y0 = center - half_new
+            y1 = center + half_new
+            clip = fitz.Rect(0, y0, page.rect.width, y1)
 
-        # Center and shrink the clip region
-        center_y = (y0 + y1) / 2
-        half_h = max(0, (y1 - y0 - shrink) / 2)
-        y0_clip = center_y - half_h
-        y1_clip = center_y + half_h
+            # Scale horizontally to fit
+            scale = (W - 2 * margin_pt) / page.rect.width
+            scaled_h = (y1 - y0) * scale
 
-        clip = fitz.Rect(0, y0_clip, page.rect.width, y1_clip)
-        scale = (w - 2 * margin_pt) / page.rect.width
-        scaled_h = (y1_clip - y0_clip) * scale
+            # New output page if needed
+            if y_offset + scaled_h > H - margin_pt:
+                out_page = dst_doc.new_page(width=W, height=H)
+                y_offset = margin_pt
 
-        # New A4 page if not enough space
-        if y_offset + scaled_h > h - margin_pt:
-            current_page = dst.new_page(width=w, height=h)
-            y_offset = margin_pt
+            dest = fitz.Rect(margin_pt, y_offset, margin_pt + (W - 2 * margin_pt), y_offset + scaled_h)
+            out_page.show_pdf_page(dest, src_doc, pno, clip=clip)
+            y_offset += scaled_h + margin_pt
 
-        dest_rect = fitz.Rect(margin_pt, y_offset,
-                              margin_pt + (w - 2 * margin_pt),
-                              y_offset + scaled_h)
-        current_page.show_pdf_page(dest_rect, src, page_num, clip=clip)
-        y_offset += scaled_h + margin_pt
-
-    # Save result to bytes
-    buf = io.BytesIO()
-    dst.save(buf)
-    return buf.getvalue()
-
-# Streamlit UI
-st.title('TTBB Voice Extractor & A4 Stacker')
-uploaded_file = st.file_uploader('Upload TTBB Score PDF', type=['pdf'])
-voice_input = st.text_input('Voice Labels (comma-separated)', value='Tenor II, Ten II')
-voice_labels = [v.strip() for v in voice_input.split(',') if v.strip()]
-
-# Parameter inputs
-col1, col2, col3 = st.columns(3)
-with col1:
-    shift_mm = st.number_input('Shift Up (mm)', min_value=0.0, max_value=100.0, value=5.0)
-with col2:
-    shrink_mm = st.number_input('Shrink Height (mm)', min_value=0.0, max_value=100.0, value=5.0)
-with col3:
-    margin_pt = st.number_input('Margin (pt)', min_value=0.0, max_value=200.0, value=20.0)
-
-if uploaded_file and st.button('Extract & Generate PDF'):
-    with st.spinner('Processing...'):
-        pdf_bytes = extract_voice(uploaded_file.read(), voice_labels, shift_mm, shrink_mm, margin_pt)
-    st.success('Done! Download below.')
-    st.download_button('Download Extracted PDF',
-                       data=pdf_bytes,
-                       file_name='extracted_' + '_'.join([v.replace(' ', '_') for v in voice_labels]) + '.pdf',
-                       mime='application/pdf')
+        # Save to buffer and provide download
+        buffer = dst_doc.write()
+        st.success("Extraction complete! 🎉")
+        st.download_button(
+            label="Download Extracted PDF",
+            data=buffer,
+            file_name="extracted_staves.pdf",
+            mime="application/pdf",
+        )
+else:
+    st.info("Upload a PDF and configure labels & settings in the sidebar to get started.")
