@@ -35,7 +35,7 @@ def collect_crops(
         for page_number in range(src_doc.page_count):
             page = src_doc.load_page(page_number)
             try:
-                rects = page.search_for(label)
+                rects = page.search_for(label, flags=3)  # 3 = case‑sensitive + whole‑word
             except TypeError:
                 rects = page.searchFor(label, 9999)  # very old PyMuPDF fallback
 
