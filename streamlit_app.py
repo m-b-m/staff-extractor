@@ -6,34 +6,53 @@ from typing import List, Tuple
 st.set_page_config(page_title="Music Staff Extractor", page_icon="🎼", layout="centered")
 
 
-def parse_labels(text: str) -> List[str]:
-    """Turn a comma-separated string into a list of non-empty labels."""
-    return [lbl.strip() for lbl in text.split(",") if lbl.strip()]
+# ------------------------- Helpers ------------------------- #
+
+def parse_label_lines(text: str) -> List[str]:
+    """Return non‑empty, stripped lines (labels)."""
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def collect_crops(src_doc: fitz.Document, labels: List[str], offset: float, height: float) -> List[Tuple[int, fitz.Rect, float]]:
-    """Return a sorted list of (page_number, crop_rect, segment_height)."""
+def collect_crops(
+    src_doc: fitz.Document,
+    labels: List[str],
+    offset: float,
+    height: float,
+    y_overlap_tol: float = 3.0,
+) -> List[Tuple[int, fitz.Rect, float]]:
+    """Find each *exact* label (avoid substrings) and return crop rects.
+
+    Strategy: process labels **longest‑first** so that "Bass II" is found and later
+    overlapped hits for "Bass I" are discarded if they fall inside the same y‑band.
+    """
     crops: List[Tuple[int, fitz.Rect, float]] = []
 
-    # Iterate through pages and search for each label
-    for page_number in range(src_doc.page_count):
-        page = src_doc.load_page(page_number)
-        for label in labels:
-            # PyMuPDF 1.23+ no longer supports the `hit_max` kwarg.  
-            # The call below returns *all* hits; if you are on an older version it still works.
+    # Keep index by page of label y‑positions already taken
+    taken: dict[int, List[float]] = {}
+
+    # Search longer labels first to minimise substring collisions
+    for label in sorted(labels, key=len, reverse=True):
+        for page_number in range(src_doc.page_count):
+            page = src_doc.load_page(page_number)
             try:
                 rects = page.search_for(label)
             except TypeError:
-                # Fall back in case a very old PyMuPDF requires positional `hit_max` (<= 1.18)
-                rects = page.searchFor(label, 9999)  # type: ignore[attr-defined]
+                rects = page.searchFor(label, 9999)  # very old PyMuPDF fallback
 
             for rect in rects:
+                # Skip if another (longer) label was already found on ~same y‑coordinate
+                y_cent = (rect.y0 + rect.y1) / 2
+                if any(abs(y_cent - y_) <= y_overlap_tol for y_ in taken.get(page_number, [])):
+                    continue
+
                 top = max(rect.y0 - offset, 0)
                 bottom = min(top + height, page.rect.height)
                 crop_rect = fitz.Rect(0, top, page.rect.width, bottom)
                 crops.append((page_number, crop_rect, bottom - top))
 
-    # Preserve reading order: first by page, then top‑to‑bottom
+                taken.setdefault(page_number, []).append(y_cent)
+
+    # Preserve reading order
     crops.sort(key=lambda x: (x[0], x[1].y0))
     return crops
 
@@ -70,13 +89,18 @@ st.title("🎼 Music Staff Extractor")
 st.markdown(
     """
 Upload a PDF score that contains labeled music staffs (e.g. **T1**, **Tenor II**, **Baritone**).
-Enter one or more labels to extract, adjust the cropping parameters, and click **Extract**
-to download a new PDF that contains only the selected staffs.
+Enter one label **per line** in the box below – this prevents accidental substring
+matches (``Bass I`` no longer hits ``Bass II``).  Adjust the cropping parameters and
+click **Extract** to download a new PDF with only the selected staffs.
     """
 )
 
 uploaded_pdf = st.file_uploader("**1. Upload PDF score**", type=["pdf"])
-label_text = st.text_input("**2. Staff labels (comma-separated)**", value="T1, Baritone")
+label_text = st.text_area(
+    "**2. Staff labels (one per line, case‑sensitive)**",
+    value="T1\nBass I\nBass II",
+    height=120,
+)
 
 st.write("**3. Cropping options** (points)")
 col1, col2 = st.columns(2)
@@ -92,7 +116,7 @@ if extract_btn:
         st.error("Please upload a PDF score first.")
         st.stop()
 
-    labels = parse_labels(label_text)
+    labels = parse_label_lines(label_text)
     if not labels:
         st.error("Please enter at least one staff label.")
         st.stop()
