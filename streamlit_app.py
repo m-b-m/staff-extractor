@@ -2,13 +2,14 @@ import streamlit as st
 import fitz  # PyMuPDF
 import io
 
-# Convert mm to points
+# Convert millimeters to points
 def mm_to_pt(mm):
     return mm * 72 / 25.4
 
 # Core extraction function
+# voice_labels: list of exact labels to search (e.g. ['Tenor II', 'Ten II'])
 def extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt):
-    # voice_labels: list of strings to match exactly
+    # Open source PDF from bytes
     src = fitz.open(stream=input_bytes, filetype='pdf')
     dst = fitz.open()
     a4 = fitz.paper_rect('a4')
@@ -16,27 +17,26 @@ def extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt):
     shift = mm_to_pt(shift_mm)
     shrink = mm_to_pt(shrink_mm)
 
-    # TTBB hierarchy for boundary detection
+    # Hierarchy for boundary detection
     hierarchy = ['Tenor I', 'Tenor II', 'Bass I', 'Bass II']
+    # Choose first matching canonical label in hierarchy
+    canonical = next((hl for hl in hierarchy if hl in voice_labels), None)
 
-    # Determine canonical label for boundary detection (first that matches hierarchy)
-    canonical = None
-    for hl in hierarchy:
-        if hl in voice_labels:
-            canonical = hl
-            break
-
-    # Initialize output page and offset
+    # Start first output page
     current_page = dst.new_page(width=w, height=h)
     y_offset = margin_pt
 
-    # Process each source page
+    # Iterate through all pages
     for page_num in range(len(src)):
         page = src[page_num]
-        # find voice label occurrence
+        # Find any of the voice labels on the page
         instances = None
         for lbl in voice_labels:
             inst = page.search_for(lbl)
+            if not inst:
+                # also try variant with a dot after first word
+                dot_lbl = lbl.replace(' ', '. ')  
+                inst = page.search_for(dot_lbl)
             if inst:
                 instances = inst
                 break
@@ -44,7 +44,7 @@ def extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt):
             continue
         t = instances[0]
 
-        # Boundary detection using hierarchy
+        # Determine bottom boundary via next label in hierarchy
         b_list = []
         if canonical:
             try:
@@ -54,63 +54,67 @@ def extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt):
             except (ValueError, IndexError):
                 b_list = []
 
-        # Compute original clip region
-        y0_orig = max(0, t.y0 - margin_pt - shift)
+        y0 = max(0, t.y0 - margin_pt - shift)
         if b_list:
-            y1_orig = b_list[0].y0 - shift
+            y1 = b_list[0].y0 - shift
         else:
-            y1_orig = t.y1 + mm_to_pt(100) - shift
+            # fallback region if no next label
+            y1 = t.y1 + mm_to_pt(100) - shift
 
-        # Center and shrink
-        center_y = (y0_orig + y1_orig) / 2
-        half_h_new = (y1_orig - y0_orig - shrink) / 2
-        y0 = center_y - half_h_new
-        y1 = center_y + half_h_new
+        # Center and shrink the clip region by 'shrink'
+        center_y = (y0 + y1) / 2
+        half_h = (y1 - y0 - shrink) / 2
+        y0_clip = center_y - half_h
+        y1_clip = center_y + half_h
 
-        clip = fitz.Rect(0, y0, page.rect.width, y1)
+        clip = fitz.Rect(0, y0_clip, page.rect.width, y1_clip)
         scale = (w - 2 * margin_pt) / page.rect.width
-        scaled_h = (y1 - y0) * scale
+        scaled_h = (y1_clip - y0_clip) * scale
 
-        # Start new A4 page if needed
+        # If not enough space on current A4, start a new page
         if y_offset + scaled_h > h - margin_pt:
             current_page = dst.new_page(width=w, height=h)
             y_offset = margin_pt
 
-        # Place clipped content
-        dest_rect = fitz.Rect(margin_pt, y_offset,
-                              margin_pt + (w - 2 * margin_pt),
-                              y_offset + scaled_h)
-        current_page.show_pdf_page(dest_rect, src, page_num, clip=clip)
+        dest = fitz.Rect(margin_pt, y_offset,
+                         margin_pt + (w - 2 * margin_pt),
+                         y_offset + scaled_h)
+        current_page.show_pdf_page(dest, src, page_num, clip=clip)
         y_offset += scaled_h + margin_pt
 
-    # Return PDF bytes
+    # Save to bytes
     buf = io.BytesIO()
     dst.save(buf)
     return buf.getvalue()
 
 # Streamlit UI
 st.title('TTBB Voice Extractor & A4 Stacker')
-
 uploaded_file = st.file_uploader('Upload TTBB Score PDF', type=['pdf'])
-voice_input = st.text_input('Voice Labels (comma-separated)', value='Tenor II')
-
-# Parse labels
+voice_input = st.text_input('Voice Labels (comma-separated)', value='Tenor II, Ten II')
+# Parse input labels
 voice_labels = [v.strip() for v in voice_input.split(',') if v.strip()]
 
+# Parameter inputs
 col1, col2, col3 = st.columns(3)
 with col1:
-    shift_mm = st.number_input('Shift Up (mm)', 0.0, 100.0, 5.0)
+    shift_mm = st.number_input('Shift Up (mm)', min_value=0.0, max_value=100.0, value=5.0)
 with col2:
-    shrink_mm = st.number_input('Shrink Height (mm)', 0.0, 100.0, 5.0)
+    shrink_mm = st.number_input('Shrink Height (mm)', min_value=0.0, max_value=100.0, value=5.0)
 with col3:
-    margin_pt = st.number_input('Margin (pt)', 0.0, 200.0, 20.0)
+    margin_pt = st.number_input('Margin (pt)', min_value=0.0, max_value=200.0, value=20.0)
+
+# Extract button
+def process():
+    input_bytes = uploaded_file.read()
+    return extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt)
 
 if uploaded_file and st.button('Extract & Generate PDF'):
     with st.spinner('Processing...'):
-        input_bytes = uploaded_file.read()
-        output_bytes = extract_voice(input_bytes, voice_labels, shift_mm, shrink_mm, margin_pt)
+        pdf_bytes = process()
     st.success('Done! Download below.')
-    st.download_button('Download Extracted PDF',
-                       data=output_bytes,
-                       file_name='extracted_' + '_'.join([v.replace(' ', '_') for v in voice_labels]) + '.pdf',
-                       mime='application/pdf')
+    st.download_button(
+        'Download Extracted PDF',
+        data=pdf_bytes,
+        file_name='extracted_' + '_'.join([v.replace(' ', '_') for v in voice_labels]) + '.pdf',
+        mime='application/pdf'
+    )
