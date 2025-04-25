@@ -18,41 +18,48 @@ def collect_crops(
     labels: List[str],
     offset: float,
     height: float,
-    y_overlap_tol: float = 3.0,
+    y_overlap_tol: float = 6.0,
 ) -> List[Tuple[int, fitz.Rect, float]]:
-    """Find each *exact* label (avoid substrings) and return crop rects.
+    """Find *exact* label occurrences and build crop rectangles.
 
-    Strategy: process labels **longest‑first** so that "Bass II" is found and later
-    overlapped hits for "Bass I" are discarded if they fall inside the same y‑band.
+    Steps per label per page:
+    1. search_for → candidate rectangles.
+    2. Read the visible text inside that rectangle.
+    3. Accept the hit only if the extracted text (collapsed whitespace) *exactly* equals the
+       label (case‑sensitive).  This prevents "Bass I" from matching "Bass II".
+    4. Skip if another accepted label already occupies ~same y‑band (dedup).
     """
     crops: List[Tuple[int, fitz.Rect, float]] = []
+    taken_by_page: dict[int, List[float]] = {}
 
-    # Keep index by page of label y‑positions already taken
-    taken: dict[int, List[float]] = {}
+    labels_sorted = sorted(labels, key=len, reverse=True)
 
-    # Search longer labels first to minimise substring collisions
-    for label in sorted(labels, key=len, reverse=True):
+    for label in labels_sorted:
         for page_number in range(src_doc.page_count):
             page = src_doc.load_page(page_number)
             try:
-                rects = page.search_for(label, flags=3)  # 3 = case‑sensitive + whole‑word
+                cand_rects = page.search_for(label, flags=3)  # case & whole‑word
             except TypeError:
-                rects = page.searchFor(label, 9999)  # very old PyMuPDF fallback
+                cand_rects = page.searchFor(label, 9999)       # very old fallback
 
-            for rect in rects:
-                # Skip if another (longer) label was already found on ~same y‑coordinate
+            for rect in cand_rects:
+                # 2️⃣ exact text check inside the rectangle
+                raw_txt = page.get_text("text", clip=rect).strip()
+                # Collapse consecutive whitespace to a single space for reliable compare
+                norm_txt = " ".join(raw_txt.split())
+                if norm_txt != label:
+                    continue  # not an exact match
+
                 y_cent = (rect.y0 + rect.y1) / 2
-                if any(abs(y_cent - y_) <= y_overlap_tol for y_ in taken.get(page_number, [])):
-                    continue
+                if any(abs(y_cent - prev) <= y_overlap_tol for prev in taken_by_page.get(page_number, [])):
+                    continue  # already have a label here
 
                 top = max(rect.y0 - offset, 0)
                 bottom = min(top + height, page.rect.height)
                 crop_rect = fitz.Rect(0, top, page.rect.width, bottom)
                 crops.append((page_number, crop_rect, bottom - top))
+                taken_by_page.setdefault(page_number, []).append(y_cent)
 
-                taken.setdefault(page_number, []).append(y_cent)
-
-    # Preserve reading order
     crops.sort(key=lambda x: (x[0], x[1].y0))
     return crops
 
