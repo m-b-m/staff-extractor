@@ -1,4 +1,4 @@
-import io, os, tempfile
+import io, os
 from typing import List, Tuple
 
 import cv2
@@ -7,137 +7,135 @@ import numpy as np
 import pytesseract
 import streamlit as st
 
+st.set_page_config(page_title="Music Staff Extractor – OCR", page_icon="🎼")
 
-# --------------- Streamlit UI --------------- #
-st.set_page_config(page_title="Music Staff Extractor – OCR version", page_icon="🎼")
+# ------------------------- UI ------------------------- #
 st.title("🎼 Music Staff Extractor – vision + OCR")
 
 st.markdown(
-    "Upload a choral score PDF, list staff labels (one per line), and "
-    "download a PDF containing **only** those systems."
+    "Upload a choral score PDF, type staff labels (one per line).  The app "
+    "detects each system visually, OCRs the label at the left, and keeps only "
+    "systems whose label text matches one you entered."
 )
 
 pdf_file = st.file_uploader("PDF score", type=["pdf"])
-labels_raw = st.text_area(
-    "Target staff labels – one per line (case-insensitive)",
-    "Bass I\nBass II\nTenor II",
-    height=120,
-)
-labels = {l.strip().lower() for l in labels_raw.splitlines() if l.strip()}
+labels_raw = st.text_area("Target staff labels – one per line", "Bass I\nBass II", height=120)
+labels_set = {l.strip().lower() for l in labels_raw.splitlines() if l.strip()}
 
-offset_px = st.slider("Extra vertical padding around staff (px)", 0, 60, 20, 2)
-extract_btn = st.button("🚀 Extract Staffs")
+extra_pad = st.slider("Extra vertical padding around staff (px)", 0, 80, 20, 2)
+run_btn = st.button("🚀 Extract")
 
+# -------------------- Vision helpers -------------------- #
 
-# --------------- Vision helpers --------------- #
 def page_to_img(page, zoom=2.0) -> np.ndarray:
-    """Render a PyMuPDF page to a CV2 BGR image."""
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
-def detect_system_bboxes(img: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """
-    Return bounding boxes (x,y,w,h) for staff systems on this page image.
-
-    Heuristic: find wide horizontal contours of roughly staff height.
-    """
+def detect_systems(img: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Return (x,y,w,h) boxes for horizontal staff systems."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # edge-detect & dilate horizontal lines
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 5))
-    dil = cv2.dilate(edges, kernel, iterations=2)
+    # emphasise horizontal lines
+    sobel = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    sobel = cv2.convertScaleAbs(sobel)
+    _, th = cv2.threshold(sobel, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (gray.shape[1] // 4, 5))
+    dil = cv2.dilate(th, kernel, iterations=2)
 
     contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    bboxes = []
-    h, w = gray.shape
+    boxes = []
+    h_img, w_img = gray.shape
     for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        # keep wide boxes occupying most of page width & reasonable height
-        if cw > 0.7 * w and 40 < ch < 250:
-            bboxes.append((x, y, cw, ch))
-    # top-to-bottom order
-    bboxes.sort(key=lambda b: b[1])
-    return bboxes
+        x, y, w, h = cv2.boundingRect(c)
+        if w > 0.65 * w_img and 40 < h < 260:
+            boxes.append((x, y, w, h))
+    boxes.sort(key=lambda b: b[1])
+    return boxes
 
 
-def ocr_label(img: np.ndarray) -> str:
-    """OCR a small color/BGR image strip -> cleaned lowercase text."""
-    txt = pytesseract.image_to_string(img, config="--psm 7")
-    return " ".join(txt.strip().split()).lower()  # collapse whitespace
+def clean_text(txt: str) -> str:
+    return " ".join(txt.strip().replace("\n", " ").split()).lower()
 
 
-# --------------- Extraction pipeline --------------- #
-def extract_staffs_from_pdf(pdf_bytes: bytes, target_labels: set[str]) -> bytes:
+def ocr_strip(img: np.ndarray) -> str:
+    if img.size == 0:
+        return ""
+    cfg = "--psm 7 --oem 3"
+    txt = pytesseract.image_to_string(img, config=cfg)
+    return clean_text(txt)
+
+
+# -------------------- Extraction core -------------------- #
+
+def extract_staffs(pdf_bytes: bytes, targets: set[str], pad: int) -> Tuple[bytes, List[str]]:
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out = fitz.open()  # new PDF
+    dst = fitz.open()
     a4w, a4h = fitz.paper_size("a4")
 
-    y_cursor = 20
-    page_out = None
+    found_labels = []
+    y_cursor, dst_page = 20, None
     gap = 10
 
     for pno in range(src.page_count):
         page = src.load_page(pno)
         img = page_to_img(page, zoom=2.0)
-        bboxes = detect_system_bboxes(img)
+        systems = detect_systems(img)
+        scale = 0.5  # because zoom=2
 
-        for (x, y, w, h) in bboxes:
-            # crop left-side label strip (first 180 px)
-            label_strip = img[y : y + h, 0 : min(180, w)]
-            txt = ocr_label(label_strip)
-            if txt not in target_labels:
-                continue  # not a wanted staff
+        for (x, y, w, h) in systems:
+            strip = img[y : y + h, 0 : min(220, w)]
+            label_txt = ocr_strip(strip)
+            if label_txt in targets:
+                found_labels.append(label_txt)
+            else:
+                continue
 
-            # convert bbox back to PDF coordinates
-            # note: PyMuPDF image rendered at zoom=2 → scale = 1/2
-            scale = 0.5
-            top_pdf = (y - offset_px) * scale
-            bottom_pdf = (y + h + offset_px) * scale
-            clip = fitz.Rect(0, top_pdf, page.rect.width, bottom_pdf)
-            seg_height = clip.height
+            top = max(0, (y - pad) * scale)
+            bottom = min(page.rect.height, (y + h + pad) * scale)
+            clip = fitz.Rect(0, top, page.rect.width, bottom)
+            seg_h = clip.height
 
-            if page_out is None or y_cursor + seg_height > a4h - 20:
-                page_out = out.new_page(width=a4w, height=a4h)
+            if dst_page is None or y_cursor + seg_h > a4h - 20:
+                dst_page = dst.new_page(width=a4w, height=a4h)
                 y_cursor = 20
 
-            dest = fitz.Rect(0, y_cursor, a4w, y_cursor + seg_height)
-            page_out.show_pdf_page(dest, src, pno, clip=clip)
-            y_cursor += seg_height + gap
+            dest_rect = fitz.Rect(0, y_cursor, a4w, y_cursor + seg_h)
+            dst_page.show_pdf_page(dest_rect, src, pno, clip=clip)
+            y_cursor += seg_h + gap
 
-    # save to bytes
     buf = io.BytesIO()
-    out.save(buf, deflate=True)
-    out.close()
+    if dst.page_count:
+        dst.save(buf, deflate=True)
+    dst.close()
     src.close()
-    return buf.getvalue()
+    return buf.getvalue(), found_labels
 
 
-# --------------- Run extraction --------------- #
-if extract_btn:
+# -------------------- Run on click -------------------- #
+if run_btn:
     if not pdf_file:
         st.error("Upload a PDF first.")
         st.stop()
-    if not labels:
+    if not labels_set:
         st.error("Enter at least one label.")
         st.stop()
 
-    with st.spinner("Detecting staffs and running OCR…"):
-        try:
-            result_bytes = extract_staffs_from_pdf(pdf_file.read(), labels)
-        except Exception as exc:
-            st.error(f"Failed: {exc}")
-            st.stop()
+    with st.spinner("Running computer vision + OCR …"):
+        pdf_bytes, hits = extract_staffs(pdf_file.read(), labels_set, extra_pad)
 
-    if result_bytes:
-        st.success("Done!")
+    if not pdf_bytes:
+        st.warning("No matching systems were found.")
+        if hits:
+            st.info("However, OCR did detect these labels on the pages: " + ", ".join(sorted(set(hits))))
+        else:
+            st.info("OCR saw no recognisable labels – try adjusting label text or check scan quality.")
+    else:
+        st.success(f"Done! Found {len(hits)} matching systems across the score.")
         st.download_button(
             "📥 Download extracted PDF",
-            data=result_bytes,
+            data=pdf_bytes,
             file_name="extracted_staffs.pdf",
             mime="application/pdf",
         )
-    else:
-        st.warning("No matching staffs found.")
