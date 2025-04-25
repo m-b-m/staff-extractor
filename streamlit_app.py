@@ -1,120 +1,112 @@
-import re
-import io
-import fitz  # PyMuPDF
 import streamlit as st
+import fitz  # PyMuPDF
+import io
+from typing import List, Tuple
 
-st.title("Staff System Extractor")
+st.set_page_config(page_title="Music Staff Extractor", page_icon="🎼", layout="centered")
 
-# File uploader for PDF
-uploaded_file = st.file_uploader("Upload a music PDF", type=["pdf"])
-if uploaded_file is not None:
+
+def parse_labels(text: str) -> List[str]:
+    """Turn a comma‑separated string into a list of non‑empty labels."""
+    return [lbl.strip() for lbl in text.split(",") if lbl.strip()]
+
+
+def collect_crops(src_doc: fitz.Document, labels: List[str], offset: float, height: float) -> List[Tuple[int, fitz.Rect, float]]:
+    """Return a sorted list of (page_number, crop_rect, segment_height)."""
+    crops = []
+    for page_number in range(src_doc.page_count):
+        page = src_doc.load_page(page_number)
+        for label in labels:
+            rects = page.search_for(label, hit_max=9999)
+            for rect in rects:
+                top = max(rect.y0 - offset, 0)
+                bottom = min(top + height, page.rect.height)
+                crop_rect = fitz.Rect(0, top, page.rect.width, bottom)
+                crops.append((page_number, crop_rect, bottom - top))
+    # Sort by page then vertical position (top‑to‑bottom)
+    crops.sort(key=lambda x: (x[0], x[1].y0))
+    return crops
+
+
+def assemble_pdf(src_doc: fitz.Document, crops: List[Tuple[int, fitz.Rect, float]]) -> io.BytesIO:
+    """Create an A4 PDF with the cropped staff segments and return it as BytesIO."""
+    out_doc = fitz.open()
+    a4_width, a4_height = fitz.paper_size("a4")
+
+    current_page = None
+    cursor_y = 20  # top margin in points
+    gap = 10       # gap between snippets
+
+    for page_number, crop_rect, seg_height in crops:
+        if current_page is None or cursor_y + seg_height > a4_height - 20:  # new page if needed
+            current_page = out_doc.new_page(width=a4_width, height=a4_height)
+            cursor_y = 20
+
+        target_rect = fitz.Rect(0, cursor_y, a4_width, cursor_y + seg_height)
+        current_page.show_pdf_page(target_rect, src_doc, page_number, clip=crop_rect)
+        cursor_y += seg_height + gap
+
+    buffer = io.BytesIO()
+    out_doc.save(buffer, garbage=4, deflate=True)
+    out_doc.close()
+    buffer.seek(0)
+    return buffer
+
+
+# -------------------------- Streamlit UI ---------------------------- #
+
+st.title("🎼 Music Staff Extractor")
+
+st.markdown(
+    """
+Upload a PDF score that contains labeled music staffs (e.g. **T1**, **Tenor II**, **Baritone**).
+Enter one or more labels to extract, adjust the cropping parameters, and click **Extract**
+to download a new PDF that contains only the selected staffs.
+    """
+)
+
+uploaded_pdf = st.file_uploader("**1. Upload PDF score**", type=["pdf"])
+label_text = st.text_input("**2. Staff labels (comma‑separated)**", value="T1, Baritone")
+
+st.write("**3. Cropping options** (points)")
+col1, col2 = st.columns(2)
+with col1:
+    offset_val = st.slider("Vertical offset ↑", min_value=0, max_value=120, value=10, step=2)
+with col2:
+    height_val = st.slider("Crop height", min_value=40, max_value=300, value=80, step=2)
+
+extract_btn = st.button("🚀 Extract Staffs")
+
+if extract_btn:
+    if uploaded_pdf is None:
+        st.error("Please upload a PDF score first.")
+        st.stop()
+
+    labels = parse_labels(label_text)
+    if not labels:
+        st.error("Please enter at least one staff label.")
+        st.stop()
+
+    # Read uploaded PDF into memory once so we can re‑open several times if needed
+    pdf_bytes = uploaded_pdf.read()
+
     try:
-        # Load PDF into PyMuPDF document
-        pdf_data = uploaded_file.read()
-        doc = fitz.open(stream=pdf_data, filetype="pdf")
+        with st.spinner("Processing… this may take a moment for large files"):
+            src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            crops = collect_crops(src_doc, labels, offset_val, height_val)
+            if not crops:
+                st.warning("No matching labels were found in the document.")
+                st.stop()
+            out_buffer = assemble_pdf(src_doc, crops)
+            src_doc.close()
+
+        st.success(f"Done! Extracted {len(crops)} staff segment{'s' if len(crops)!=1 else ''}.")
+        st.download_button(
+            label="💾 Download extracted PDF",
+            data=out_buffer,
+            file_name="extracted_staffs.pdf",
+            mime="application/pdf",
+        )
+
     except Exception as e:
-        st.error(f"Error opening PDF: {e}")
-    else:
-        # User input for labels (comma-separated)
-        labels_input = st.text_input("Enter staff labels to extract (comma-separated)", "")
-        if labels_input:
-            # Prepare label list and normalized set for matching
-            label_list = [lbl.strip() for lbl in labels_input.split(",") if lbl.strip()]
-            norm_labels = { re.sub(r"[^A-Za-z0-9]", "", lbl).lower() for lbl in label_list }
-            
-            # Find all candidate labels near left margin
-            left_margin_threshold = 50  # points (approx 0.7 inches) for left-aligned labels
-            all_labels = []  # will hold tuples (page_number, top_y, bottom_y, text)
-            for page_index in range(doc.page_count):
-                page = doc[page_index]
-                blocks = page.get_text("dict")["blocks"]
-                for block in blocks:
-                    if block.get("type") == 0:  # text block
-                        for line in block.get("lines", []):
-                            x0, y0, x1, y1 = line["bbox"]
-                            text = "".join(span["text"] for span in line["spans"]).strip()
-                            if not text:
-                                continue
-                            # Check if text is near left and contains letters (likely a label)
-                            if x0 < left_margin_threshold and re.search("[A-Za-z]", text):
-                                # Exclude obvious non-label lines (composer, title, etc.)
-                                if any(kw in text for kw in ["Words and Music by", "Arr.", "From "]):
-                                    continue
-                                all_labels.append((page_index + 1, y0, y1, text))
-            # Sort labels by page and vertical position
-            all_labels.sort(key=lambda t: (t[0], t[1]))
-            
-            # Filter for target labels
-            target_labels = [lab for lab in all_labels 
-                             if re.sub(r"[^A-Za-z0-9]", "", lab[3]).lower() in norm_labels]
-            
-            if not target_labels:
-                st.warning("No staff systems found for the given labels.")
-            else:
-                # Prepare a new PDF for output
-                output_doc = fitz.open()
-                page_width, page_height = doc[0].rect.width, doc[0].rect.height
-                # Define layout parameters for output pages
-                top_margin = 10  # points
-                bottom_margin = 10
-                vertical_gap = 5   # gap between cropped images on output page
-                # Use a matrix to scale images (for better resolution)
-                zoom_factor = 2.0  # 2x zoom for higher DPI output
-                mat = fitz.Matrix(zoom_factor, zoom_factor)
-                
-                y_cursor = 0
-                output_page = None
-                
-                # Helper function to add a new blank page to output_doc
-                def add_output_page():
-                    return output_doc.new_page(width=page_width, height=page_height)
-                
-                # Iterate through each target label and crop the corresponding region
-                prev_page = None
-                for (page_num, label_y_top, label_y_bottom, label_text) in target_labels:
-                    page = doc[page_num - 1]
-                    # Determine crop top boundary
-                    if prev_page != page_num:  # new page in original PDF
-                        # If this label is first on its page (no previous label on same page)
-                        # include a small margin above
-                        top_crop = max(0, label_y_top - 20)
-                    else:
-                        # Not the first label on page – start exactly at this label
-                        top_crop = label_y_top
-                    prev_page = page_num
-                    # Determine crop bottom boundary (either next label or fallback height)
-                    # Find the next label on the same page
-                    next_label = next((lab for lab in all_labels 
-                                       if lab[0] == page_num and lab[1] > label_y_top), None)
-                    if next_label:
-                        bottom_crop = next_label[1]  # top Y of the next label
-                    else:
-                        # No next label on this page: extend a fixed fallback height
-                        bottom_crop = min(page.rect.height, label_y_top + 120)
-                    
-                    # Clip and render the region to an image (pixmap)
-                    clip_rect = fitz.Rect(0, top_crop, page_width, bottom_crop)
-                    pix = page.get_pixmap(matrix=mat, clip=clip_rect)
-                    img_height_points = pix.height / zoom_factor  # height in points at original scale
-                    
-                    # Start a new output page if needed
-                    if output_page is None or y_cursor + img_height_points > page_height - bottom_margin:
-                        output_page = add_output_page()
-                        y_cursor = top_margin
-                    # Compute target rectangle on output page and insert the image
-                    target_rect = fitz.Rect(0, y_cursor, page_width, y_cursor + img_height_points)
-                    output_page.insert_image(target_rect, pixmap=pix)
-                    # Update cursor for next image position
-                    y_cursor += img_height_points + vertical_gap
-                
-                # Save output PDF to memory and provide download
-                output_buffer = io.BytesIO()
-                output_doc.save(output_buffer, garbage=4)
-                output_pdf_bytes = output_buffer.getvalue()
-                st.success(f"Extraction complete! Extracted {len(target_labels)} staff systems.")
-                st.download_button(
-                    label="Download Extracted PDF",
-                    data=output_pdf_bytes,
-                    file_name="extracted_staves.pdf",
-                    mime="application/pdf"
-                )
+        st.error(f"Something went wrong: {e}")
